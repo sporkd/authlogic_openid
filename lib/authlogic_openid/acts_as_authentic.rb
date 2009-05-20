@@ -43,6 +43,17 @@ module AuthlogicOpenid
         klass.class_eval do
           validates_uniqueness_of :openid_identifier, :scope => validations_scope, :if => :using_openid?
           validate :validate_openid
+          
+          # Do we want to require a login when using openid?
+          validates_length_of_login_field_options validates_length_of_login_field_options.merge(:unless => :using_openid?)
+          validates_format_of_login_field_options validates_format_of_login_field_options.merge(:unless => :using_openid?)
+          validates_uniqueness_of_login_field_options validates_uniqueness_of_login_field_options.merge(:unless => :using_openid?)
+          
+          # What if login_field is set to email? Or should that be handled with optional_fields
+          # validates_length_of_email_field_options validates_length_of_email_field_options.merge(:unless => :using_openid?)
+          # validates_format_of_email_field_options validates_format_of_email_field_options.merge(:unless => :using_openid?)
+          # validates_uniqueness_of_email_field_options validates_uniqueness_of_email_field_options.merge(:unless => :using_openid?)
+          
           validates_length_of_password_field_options validates_length_of_password_field_options.merge(:if => :validate_password_with_openid?)
           validates_confirmation_of_password_field_options validates_confirmation_of_password_field_options.merge(:if => :validate_password_with_openid?)
           validates_length_of_password_confirmation_field_options validates_length_of_password_confirmation_field_options.merge(:if => :validate_password_with_openid?)
@@ -110,9 +121,24 @@ module AuthlogicOpenid
         # Basically you will get a hash of values passed as a single argument. Then just map them as you see fit. Check out
         # the source of this method for an example.
         def map_openid_registration(registration) # :doc:
-          self.name ||= registration[:fullname] if respond_to?(:name) && !registration[:fullname].blank?
-          self.first_name ||= registration[:fullname].split(" ").first if respond_to?(:first_name) && !registration[:fullname].blank?
-          self.last_name ||= registration[:fullname].split(" ").last if respond_to?(:last_name) && !registration[:last_name].blank?
+          return if registration.nil? || registration.empty?
+          registration.symbolize_keys!
+          
+          if respond_to?(:name) && self.name.blank?
+            self.name = registration[:fullname] unless registration[:fullname].blank?
+          end
+          if respond_to?(:first_name) && self.first_name.blank?
+            self.first_name = registration[:fullname].split(" ").first unless registration[:fullname].blank?
+          end
+          if respond_to?(:last_name) && self.last_name.blank?
+            self.last_name = registration[:fullname].split(" ").last unless registration[:fullname].blank?
+          end
+          
+          registration.each do |key, value|
+            if respond_to?(key) && self.send(key).blank?
+              self.send("#{key}=", value) unless value.blank?
+            end
+          end
         end
         
         # This method works in conjunction with map_saved_attributes.
@@ -120,31 +146,42 @@ module AuthlogicOpenid
         # Let's say a user fills out a registration form, provides an OpenID and submits the form. They are then redirected to their
         # OpenID provider. All is good and they are redirected back. All of those fields they spent time filling out are forgetten
         # and they have to retype them all. To avoid this, AuthlogicOpenid saves all of these attributes in the session and then
-        # attempts to restore them. See the source for what attributes it saves. If you need to block more attributes, or save
-        # more just override this method and do whatever you want.
+        # attempts to restore them. See the source for what attributes it saves. You can create a whitelist of attributes to save by
+        # using attr_accessible in you model. (It's not necessary to include any authlogic or openid fields in attr_accessible).
+        # Additionally, you can prevent certain attributes from being included by specifying attr_protected in your model.
+        # If you still need to block more attributes, or save more just override this method and do whatever you want.
         def attributes_to_save # :doc:
-          attrs_to_save = attributes.clone.delete_if do |k, v|
-            [:password, crypted_password_field, password_salt_field, :persistence_token, :perishable_token, :single_access_token, :login_count, 
-              :failed_login_count, :last_request_at, :current_login_at, :last_login_at, :current_login_ip, :last_login_ip, :created_at,
-              :updated_at, :lock_version].include?(k.to_sym)
+          accessable_keys = self.class.accessible_attributes.to_a.map(&:to_sym)
+          protected_keys = self.class.protected_attributes.to_a.map(&:to_sym)
+          whitelist =  (accessable_keys - protected_keys).uniq
+          
+          attrs_to_save = {}
+          whitelist.each do |k|
+            attrs_to_save.merge!(k => self.send(k))
           end
-          attrs_to_save.merge!(:password => password, :password_confirmation => password_confirmation)
+          
+          if whitelist.empty?
+            blacklist = protected_keys + [:id, :password, :password_confirmation, crypted_password_field, password_salt_field,
+              :persistence_token, :perishable_token, :single_access_token, :login_count, :failed_login_count, :last_request_at,
+              :current_login_at, :last_login_at, :current_login_ip, :last_login_ip, :created_at, :updated_at, :lock_version]
+            blacklist = blacklist.map(&:to_sym).uniq
+            attrs_to_save = attributes.clone.delete_if { |k, v| blacklist.include?(k.to_sym ) || k.to_s.ends_with?('_id') }
+          end
+          
+          return attrs_to_save
         end
         
         # This method works in conjunction with attributes_to_save. See that method for a description of the why these methods exist.
         #
         # If the default behavior of this method is not sufficient for you because you have attr_protected or attr_accessible then
-        # override this method and set them individually. Maybe something like this would be good:
-        #
-        #   attrs.each do |key, value|
-        #     send("#{key}=", value)
-        #   end
+        # override this method and set them individually. This should not be necessary anymore because most cases should be handled
+        # by attributes_to_save with attr_accessible whitelist.
         def map_saved_attributes(attrs) # :doc:
           self.attributes = attrs
         end
         
         def validate_openid
-          errors.add(:openid_identifier, "had the following error: #{@openid_error}") if @openid_error
+          errors.add(:openid_identifier, "#{@openid_error}") if @openid_error
         end
         
         def using_openid?
